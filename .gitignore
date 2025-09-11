@@ -9,3 +9,4 @@ Countdown-Tasks-3to4/
 Qwen2.5-3B-Instruct/
 # Virtual environments
 .venv
+logs/
