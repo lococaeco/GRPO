@@ -26,6 +26,13 @@ from qwen2_model import Transformer
 # from optimizer import MemoryEfficientAdamW
 # from tokenizer import Tokenizer
 
+# 디버깅용
+def print_memory(prefix=""):
+    allocated = torch.cuda.memory_allocated() / 1024**2   # 현재 텐서가 차지하는 메모리 (MB)
+    reserved  = torch.cuda.memory_reserved() / 1024**2    # CUDA allocator가 확보한 메모리 (MB)
+    max_alloc = torch.cuda.max_memory_allocated() / 1024**2  # 실행 중 최대 점유 (MB)
+    print(f"[{prefix}] Allocated: {allocated:.2f} MB | Reserved: {reserved:.2f} MB | Max: {max_alloc:.2f} MB")
+
 def ddp_setup():
     dist.init_process_group("nccl")   # GPU 분산 학습 backend
     local_rank = int(os.environ["LOCAL_RANK"])  # torchrun이 환경변수로 줌
@@ -637,10 +644,10 @@ def update_policy(
 
 
 def main():
-
+    print("This is parallel?")
     # pathlib.Path()를 통해 여러 메서드를 사용할 수 있음. ex) exists(), is_file()
     pretrained_model_path = pathlib.Path("Qwen2.5-3B-Instruct")
-    print(pretrained_model_path)
+    # print(pretrained_model_path)
 
     dtype_map = {
         "bfloat16": torch.bfloat16,
@@ -655,16 +662,11 @@ def main():
     torch.cuda.manual_seed_all(42)
     np.random.seed(42)
      
-    # BATCH_SIZE = config["training"]["batch_size"]
-    # NUM_QUESTIONS_PER_BATCH = config["training"]["num_questions_per_batch"]
-    # NUM_ANSWERS_PER_QUESTION = BATCH_SIZE // NUM_QUESTIONS_PER_BATCH
-
     BATCH_SIZE = 256
     NUM_QUESTIONS_PER_BATCH = 32
-    NUM_ANSWERS_PER_QUESTION = BATCH_SIZE // NUM_QUESTIONS_PER_BATCH #8 
+    # NUM_ANSWERS_PER_QUESTION = BATCH_SIZE // NUM_QUESTIONS_PER_BATCH # current: 8 
 
     tokenizer_path = str(pretrained_model_path / "tokenizer.json")
-    print(tokenizer_path)
     tokenizer = Tokenizer(tokenizer_path)
 
 
@@ -690,17 +692,27 @@ def main():
         batch_size=NUM_QUESTIONS_PER_BATCH,
         sampler=train_data_sampler,                     # sampler 연결
         collate_fn=CountdownTasksDataset.collate_fn,    # batch 만들기
-        num_workers=4,                                  # (선택) CPU 병렬 로딩
-        pin_memory=True,                                # (선택) GPU 학습 속도 향상
+        # num_workers=4,                                  # (선택) CPU 병렬 로딩
+        # pin_memory=True,                                # True: Pinned Memory 사용, False: 일반 Memory -> pinned memory 사용
     )
 
+    # print(dist.get_world_size())
+    # print(dist.get_rank())
+    
     model = Transformer.from_pretrained(pretrained_model_path, device=device).train()
     model = torch.nn.parallel.DistributedDataParallel(
         model,
-        device_ids=[device.index],   # 현재 프로세스의 GPU
+        device_ids=[device.index],
         output_device=device.index,
     )
 
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+
+    # "글로벌" BATCH_SIZE를 유지하려면 rank별 에피소드 수를 나눠야 합니다.
+    PER_RANK_BATCH = max(1, BATCH_SIZE // world_size)  # 256 // 4 = 64
+    NUM_ANSWERS_PER_QUESTION = max(1, PER_RANK_BATCH // NUM_QUESTIONS_PER_BATCH)    # 64 // 32 = 2
+    
+    
     optimizer = MemoryEfficientAdamW(
         model.parameters(),
         lr=1.0e-5,
@@ -712,10 +724,13 @@ def main():
     ckpt_dir = pathlib.Path("ckpt")
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     epoch_num = 1
+    
     for epoch in range(epoch_num):
         train_data_sampler.set_epoch(epoch)
 
         for step, batch in enumerate(train_dataloader, start=1):
+            # print(f"device: {device}, rank: {dist.get_rank()}, step: {step}/{len(train_dataloader)}")
+            model.module.eval()
             episodes = rollout(
                 model=model.module,
                 tokenizer=tokenizer,
@@ -726,27 +741,34 @@ def main():
                 device=device,
                 dtype=dtype,
             )
+            
+            print_memory(f"Step {step} - after rollout")
+
+            model.module.train()
+            
             skip_unfinished_episodes = False
             if skip_unfinished_episodes:
                 episodes = [episode for episode in episodes if episode.is_finished]
             
             results = update_policy(
-                # model=model.module,
                 model=model,
                 optimizer=optimizer,
                 episodes=episodes,
-                micro_batch_size=2,
+                micro_batch_size=1,
                 pad_token_id=tokenizer.pad_token_id,
                 max_grad_norm=1.0,
                 device=device,
                 dtype=dtype,
             )
+            
+            print_memory(f"Step {step} - after update_policy")
 
             # compute and log important metrics
             reward = [episode.reward for episode in episodes]
+            
             formatted_reward = [
-                episode.reward_info["format_reward"] for episode in episodes
-            ]
+                episode.reward_info["format_reward"] for episode in episodes]
+            
             answer_reward = [episode.reward_info["answer_reward"] for episode in episodes]
             num_finished_episodes = sum(episode.is_finished for episode in episodes)
             mean_reward = np.mean(reward)
@@ -762,29 +784,22 @@ def main():
             )
 
             print(
-                f"\rStep {step}, mean_reward: {mean_reward:.2f}, "
+                f"\rStep {step}/ {len(train_dataloader)}, mean_reward: {mean_reward:.2f}, "
                 f"train success_rate: {success_rate:.2f}, "
                 f"num_finished_episodes: {num_finished_episodes}, "
                 f"mean_response_len: {mean_response_len:.2f}, "
                 f"entropy: {entropy:.2f}")
-            
-        #     if step % eval_interval == 0:
-        #         eval_success_rate = evaluate()
-        #         print(f"\rEval success rate: {eval_success_rate:.2f}" + " " * 100)
+        
 
             if dist.get_rank() == 0 and step % 100 == 0:
                 output_file = ckpt_dir / f"ckpt_{step:06d}.pt"
                 torch.save(model.module.state_dict(), output_file)
                 print(f"Saved checkpoint to {output_file}")
-
-
-    dist.destroy_process_group()
+    
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 if __name__ == "__main__":
-    # parser = ArgumentParser()
-    # parser.add_argument("--config", type=str, default="config.yaml")
-    # args = parser.parse_args()
-    # main(args.config)
     main()
 
-#OMP_NUM_THREADS=12 uv run torchrun --nproc_per_node=4 --nnodes=1 --node_rank=0 --master_addr=localhost --master_port=12355 train.py --config config.yaml
+#OMP_NUM_THREADS=2 uv run torchrun --nproc_per_node=4 --nnodes=1 --node_rank=0 --master_addr=localhost --master_port=12355 train.py --config config.yaml
